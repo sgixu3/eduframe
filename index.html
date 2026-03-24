@@ -1556,6 +1556,12 @@ const QTYPES = [
 let curUser=null, curRole=null, curIdToken=null, userDoc=null;
 let progress={}, curSec=null, curSections=[], questions=[], userAns={}, aiScores={};
 let students=[], subjects=[];
+/* messaging state — declared here to avoid TDZ errors in auth/CRM flow */
+let msgUnsubscribe=null, activeConvId=null;
+/* homework wizard state — declared here so loadHomework/showCRMTab can reference safely */
+let hwList=[], hwCreating=false, hwWizStep=1;
+let hwProfile={}, hwSelectedStrands=[], hwSelectedTopics=[], hwDifficulty='mixed';
+let hwPreviewContent='', hwEditMode=false;
 
 /* ══════════════════════════════════════════
    SCREEN NAVIGATION
@@ -1575,8 +1581,10 @@ window.showScreen = showScreen;
    AUTH STATE LISTENER
 ══════════════════════════════════════════ */
 let _lastAuthUid = null;
+console.log('[EduSG] ✅ App boot complete — waiting for auth state');
 onAuthStateChanged(auth, async user => {
   const newUid = user ? user.uid : null;
+  console.log('[EduSG] 🔑 onAuthStateChanged fired — uid:', newUid || 'null (signed out)');
   if (newUid === _lastAuthUid) { console.log('[EduSG] auth fired again for same user, skipping'); return; }
   _lastAuthUid = newUid;
   if (user) {
@@ -2000,8 +2008,9 @@ window.loadCRM = async () => {
   } else if (curRole === 'admin') {
     if (crmTab === 'linking') crmTab = 'students';
   }
-  showCRMTab(crmTab);
-  setTimeout(() => { _crmLoading = false; try { checkUnreadMessages(); } catch(e){} }, 800);
+  try { await showCRMTab(crmTab); } catch(e) { console.error('[EduSG] showCRMTab top-level crash:', e.message); }
+  _crmLoading = false;
+  setTimeout(() => { try { checkUnreadMessages(); } catch(e){} }, 400);
 };
 
 window.showCRMTab = async tab => {
@@ -2021,15 +2030,33 @@ window.showCRMTab = async tab => {
   const curTab = document.getElementById('crm-tab-curriculum');
   if(curTab) curTab.style.display = curRole==='admin'?'':'none';
 
-  if(tab==='students') await loadStudents();
-  if(tab==='linking') await loadLinking();
-  if(tab==='subjects') await loadSubjects();
-  if(tab==='exams') await loadExams();
-  if(tab==='apikeys' && curRole==='admin') await loadApiKeys();
-  if(tab==='settings') await loadSettings();
-  if(tab==='messages') await loadMessages();
-  if(tab==='homework') await loadHomework();
-  if(tab==='curriculum' && curRole==='admin') await loadCurriculumAdmin();
+  // Each tab loader is wrapped individually — one crashed feature cannot take down the dashboard
+  const _tabLoaders = {
+    students:   () => loadStudents(),
+    linking:    () => loadLinking(),
+    subjects:   () => loadSubjects(),
+    exams:      () => loadExams(),
+    apikeys:    () => curRole==='admin' ? loadApiKeys()   : Promise.resolve(),
+    settings:   () => loadSettings(),
+    messages:   () => loadMessages(),
+    homework:   () => loadHomework(),
+    curriculum: () => curRole==='admin' ? loadCurriculumAdmin() : Promise.resolve(),
+  };
+  if (_tabLoaders[tab]) {
+    try {
+      await _tabLoaders[tab]();
+    } catch(e) {
+      console.error('[EduSG] Tab loader crashed — tab:', tab, '—', e.message, e);
+      // Show a non-blocking error card inside the panel so the dashboard stays up
+      const _panel = document.getElementById('crm-panel-'+tab);
+      if (_panel) _panel.innerHTML = `<div style="text-align:center;padding:3rem 1rem">
+        <div style="font-size:2rem;margin-bottom:10px">⚠️</div>
+        <div style="font-size:14px;font-weight:600;color:var(--text);margin-bottom:6px">This section failed to load</div>
+        <div style="font-size:12px;color:var(--text3);margin-bottom:1rem">${e.message}</div>
+        <button class="btn btn-sec btn-sm" onclick="showCRMTab('${tab}')">Retry</button>
+      </div>`;
+    }
+  }
 };
 
 /* ── Students panel ── */
@@ -3112,10 +3139,15 @@ async function buildStudentHome() {
 
   // Fallback: if no teacher sections, use default topic structure
   if(!curSections.length){
-    const topics = ALL_TOPICS[grade]||ALL_TOPICS['Secondary 1'];
-    topics.forEach(t=>t.sections.forEach(s=>curSections.push({topic:t.name,name:s,qt:['mcq','short','fill'],numQ:30})));
-    if(!topics.find(t=>t.name==='Mixed Review')){
-      ['Mixed review 1','Mixed review 2','Final challenge'].forEach(s=>curSections.push({topic:'Mixed Review',name:s,qt:['mcq','short','fill'],numQ:30}));
+    const topics = ALL_TOPICS[grade] || ALL_TOPICS['Secondary 1'] || [];
+    if(topics.length) {
+      topics.forEach(t=>t.sections.forEach(s=>curSections.push({topic:t.name,name:s,qt:['mcq','short','fill'],numQ:30})));
+      if(!topics.find(t=>t.name==='Mixed Review')){
+        ['Mixed review 1','Mixed review 2','Final challenge'].forEach(s=>curSections.push({topic:'Mixed Review',name:s,qt:['mcq','short','fill'],numQ:30}));
+      }
+    } else {
+      console.warn('[EduSG] buildStudentHome: no ALL_TOPICS entry for grade:', grade, '— using hardcoded fallback');
+      ['Introduction','Core concepts','Practice','Mixed review','Final challenge'].forEach(s=>curSections.push({topic:'General',name:s,qt:['mcq','short','fill'],numQ:30}));
     }
   }
 
@@ -4271,9 +4303,7 @@ window.goCRM=()=>{
 /* ══════════════════════════════════════════
    HOMEWORK — Curriculum-aligned homework generation
 ══════════════════════════════════════════ */
-let hwList = [], hwCreating = false, hwWizStep = 1;
-let hwProfile = {}, hwSelectedStrands = [], hwSelectedTopics = [], hwDifficulty = 'mixed';
-let hwPreviewContent = '', hwEditMode = false;
+/* hwList, hwProfile etc. are declared in the main state block above */
 
 /* ── List view ── */
 async function loadHomework() {
@@ -4728,7 +4758,7 @@ window.toggleRubricSection = () => {
 };
 
 window.generateHomework = async () => {
-  const genBar = document.getElementById('hw-gen-bar'); genBar.classList.add('on');
+  const genBar = document.getElementById('hw-gen-bar'); if(genBar) genBar.classList.add('on');
   const genMsg = document.getElementById('hw-gen-msg');
   const genBtn = document.getElementById('hw-gen-btn');
   const regenBtn = document.getElementById('hw-regen-btn');
@@ -5153,8 +5183,7 @@ window.deleteStandard = async (id) => {
 };
 
 
-let msgUnsubscribe = null; // active Firestore listener
-let activeConvId   = null;
+/* msgUnsubscribe and activeConvId are declared in the main state block above */
 
 /* Conversation ID is always teacherId_studentId */
 function getConvId(teacherId, studentId) {
