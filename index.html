@@ -880,6 +880,19 @@ const auth = getAuth(app);
 const db   = getFirestore(app);
 
 /* ══════════════════════════════════════════
+   SAFE MODE — RECOVERY FLAGS
+   Set to true only AFTER dashboard load is confirmed working.
+   Keeps risky new modules from blocking the dashboard shell.
+══════════════════════════════════════════ */
+const ENABLE_MESSAGING            = true;  // real-time Firestore listener on login
+const ENABLE_ADMIN_EXTRAS         = true;  // curriculum standards admin panel
+const ENABLE_HOMEWORK_EXTRAS      = true;  // homework wizard AI generation
+const ENABLE_CURRICULUM_ENHANCEMENTS = true; // multi-country curriculum fields
+
+console.log('[EduSG] 🚀 BOOT START — safe-mode flags:',
+  {ENABLE_MESSAGING, ENABLE_ADMIN_EXTRAS, ENABLE_HOMEWORK_EXTRAS, ENABLE_CURRICULUM_ENHANCEMENTS});
+
+/* ══════════════════════════════════════════
    CURRICULUM DATABASE — Internal standards library
    6 countries: Singapore, US, Hong Kong, Malaysia, England, Japan
 ══════════════════════════════════════════ */
@@ -1580,60 +1593,147 @@ window.showScreen = showScreen;
 /* ══════════════════════════════════════════
    AUTH STATE LISTENER
 ══════════════════════════════════════════ */
+/* ══════════════════════════════════════════
+   RECOVERY BOOT — Structured startup with safe-mode guards
+   Boot order: auth → profile → role → shell → optional modules
+══════════════════════════════════════════ */
 let _lastAuthUid = null;
-console.log('[EduSG] ✅ App boot complete — waiting for auth state');
+console.log('[EduSG] ✅ DOM ready (module deferred) — registering auth listener');
+
 onAuthStateChanged(auth, async user => {
   const newUid = user ? user.uid : null;
-  console.log('[EduSG] 🔑 onAuthStateChanged fired — uid:', newUid || 'null (signed out)');
-  if (newUid === _lastAuthUid) { console.log('[EduSG] auth fired again for same user, skipping'); return; }
+
+  /* ── Dedup: Firebase sometimes fires twice for same session ── */
+  if (newUid === _lastAuthUid) {
+    console.log('[EduSG] auth: duplicate fire for same uid — skipping');
+    return;
+  }
   _lastAuthUid = newUid;
-  if (user) {
-    curUser = user;
-    curIdToken = await user.getIdToken();
-    try {
-      const ref = doc(db,'users',user.uid);
-      const snap = await getDoc(ref);
-      if (snap.exists()) {
-        userDoc = snap.data();
-        curRole = userDoc.role || 'student';
-        progress = userDoc.progress || {};
-      } else {
-        // Doc not found — race condition after registration. Retry once.
-        await new Promise(r => setTimeout(r, 1500));
-        const snap2 = await getDoc(doc(db,'users',user.uid));
-        if (snap2.exists()) {
-          userDoc = snap2.data();
-          curRole = userDoc.role || 'student';
-          progress = userDoc.progress || {};
-        } else {
-          // Truly no doc — create a minimal student doc
-          userDoc = { email: user.email, name: user.displayName||user.email.split('@')[0], role:'student', grade:'Secondary 1', progress:{}, createdAt: serverTimestamp(), approved: true };
-          try { await setDoc(doc(db,'users',user.uid), userDoc); } catch(e2) { console.warn('Could not create user doc:', e2.message); }
-          curRole = 'student';
-          progress = {};
-        }
-      }
-    } catch(e) {
-      console.error('Firestore profile load error:', e.message);
-      curRole = curRole || 'student';
-      userDoc = userDoc || { email: user.email, name: user.displayName||user.email.split('@')[0], role:'student', grade:'Secondary 1', progress:{} };
-      progress = {};
-    }
-    try { updateNav(); } catch(e) { console.error('updateNav:', e); }
-    console.log('[EduSG] role=' + JSON.stringify(curRole) + ' uid=' + curUser.uid + ' name=' + (userDoc&&userDoc.name));
-    if (curRole==='admin' || curRole==='teacher') {
-      console.log('[EduSG] → CRM');
-      showScreen('s-crm');
-      loadCRM();
-    } else {
-      console.log('[EduSG] → student home (role is not admin/teacher)');
-      try { await buildStudentHome(); } catch(e) { console.error('buildStudentHome:', e); }
-      showScreen('s-home');
-    }
-  } else {
-    curUser=null; curRole=null; curIdToken=null; userDoc=null; progress={};
-    updateNav();
+
+  /* ══ SIGNED OUT ══ */
+  if (!user) {
+    console.log('[EduSG] 🔓 Auth: signed out');
+    curUser = null; curRole = null; curIdToken = null; userDoc = null; progress = {};
+    try { updateNav(); } catch(e) { console.warn('[EduSG] updateNav (signed-out):', e.message); }
     showScreen('s-auth');
+    return;
+  }
+
+  /* ══ SIGNED IN ══ */
+  console.log('[EduSG] 🔑 Auth: signed in — uid:', user.uid);
+  curUser = user;
+
+  /* Step 1 — get ID token (needed for AI calls later) */
+  try {
+    curIdToken = await user.getIdToken();
+    console.log('[EduSG] ✅ ID token obtained');
+  } catch(e) {
+    console.warn('[EduSG] getIdToken failed (non-fatal):', e.message);
+    curIdToken = null;
+  }
+
+  /* Step 2 — load user profile from Firestore */
+  console.log('[EduSG] ⏳ Loading user profile...');
+  try {
+    const snap = await getDoc(doc(db, 'users', user.uid));
+    if (snap.exists()) {
+      userDoc = snap.data();
+    } else {
+      /* Race condition after registration — retry once after short delay */
+      console.log('[EduSG] Profile not found — retrying in 1.5s...');
+      await new Promise(r => setTimeout(r, 1500));
+      const snap2 = await getDoc(doc(db, 'users', user.uid));
+      if (snap2.exists()) {
+        userDoc = snap2.data();
+      } else {
+        /* No doc at all — bootstrap minimal profile */
+        console.warn('[EduSG] No Firestore profile found — bootstrapping minimal profile');
+        userDoc = {
+          email: user.email,
+          name: user.displayName || user.email.split('@')[0],
+          role: 'student',
+          grade: 'Secondary 1',
+          progress: {},
+          createdAt: serverTimestamp(),
+          approved: true
+        };
+        try { await setDoc(doc(db, 'users', user.uid), userDoc); }
+        catch(e2) { console.warn('[EduSG] Could not write bootstrap profile:', e2.message); }
+      }
+    }
+  } catch(e) {
+    console.error('[EduSG] ❌ Firestore profile load failed:', e.message);
+    /* RECOVERY: Fall back to a safe minimal profile so the shell still renders */
+    userDoc = userDoc || {
+      email: user.email,
+      name: user.displayName || user.email.split('@')[0],
+      role: 'student',
+      grade: 'Secondary 1',
+      progress: {}
+    };
+  }
+
+  /* Step 3 — resolve role with safe defaults */
+  curRole = (userDoc && userDoc.role) || 'student';
+  progress = (userDoc && userDoc.progress) || {};
+  console.log('[EduSG] ✅ User loaded — role:', curRole, '| name:', userDoc && userDoc.name);
+
+  /* Step 4 — update nav (non-blocking) */
+  try { updateNav(); } catch(e) { console.warn('[EduSG] updateNav error (non-fatal):', e.message); }
+
+  /* ══ Step 5 — RENDER DASHBOARD SHELL ══ */
+  if (curRole === 'admin' || curRole === 'teacher') {
+    console.log('[EduSG] 🏗️ Dashboard shell: teacher/admin path → s-crm');
+    showScreen('s-crm');
+    console.log('[EduSG] ✅ Dashboard shell visible');
+
+    /* Load the CRM shell — students tab first (safe default) */
+    try {
+      await loadCRM();
+      console.log('[EduSG] ✅ CRM loaded');
+    } catch(e) {
+      console.error('[EduSG] ❌ loadCRM threw:', e.message);
+    }
+
+    /* Step 6 — lazy-init optional modules after shell is visible */
+    setTimeout(async () => {
+      if (ENABLE_MESSAGING) {
+        console.log('[EduSG] 🔧 Lazy-init: messaging...');
+        try { await checkUnreadMessages(); console.log('[EduSG] ✅ messaging init done'); }
+        catch(e) { console.warn('[EduSG] ⚠️ messaging init failed (non-fatal):', e.message); }
+      }
+      if (ENABLE_ADMIN_EXTRAS && curRole === 'admin') {
+        console.log('[EduSG] 🔧 Lazy-init: admin extras (curriculum tab)...');
+        /* No active load — just unlocks the tab when clicked */
+        console.log('[EduSG] ✅ admin extras ready');
+      }
+    }, 600);
+
+  } else {
+    /* ── Student path ── */
+    console.log('[EduSG] 🏗️ Dashboard shell: student path → s-home');
+
+    try {
+      await buildStudentHome();
+      console.log('[EduSG] ✅ Student home built');
+    } catch(e) {
+      console.error('[EduSG] ❌ buildStudentHome threw:', e.message, e);
+      /* RECOVERY: show a basic shell even if build failed */
+      const homeSecs = document.getElementById('home-sections');
+      if (homeSecs) homeSecs.innerHTML = '<div style="padding:2rem;text-align:center;color:var(--text3)">Could not load sections — <button class="btn btn-sec btn-sm" onclick="location.reload()">Reload</button></div>';
+    }
+
+    showScreen('s-home');
+    console.log('[EduSG] ✅ Student dashboard shell visible');
+
+    /* Lazy-init optional student modules */
+    setTimeout(async () => {
+      if (ENABLE_MESSAGING) {
+        console.log('[EduSG] 🔧 Lazy-init: student messaging fab...');
+        try { await _initStudentMessageBadge(); console.log('[EduSG] ✅ student messaging ready'); }
+        catch(e) { console.warn('[EduSG] ⚠️ student messaging init failed (non-fatal):', e.message); }
+      }
+    }, 600);
   }
 });
 
@@ -1726,8 +1826,15 @@ window.selectRole = (r) => {
 function renderCurriculumFields() {
   const container = document.getElementById('reg-curriculum-fields');
   if (!container) return;
-  const grades = CURRICULUM_DB.grades[regCountry] || {};
-  const fw = CURRICULUM_DB.frameworks;
+
+  // If curriculum enhancements are disabled, show a simple fallback
+  if (!ENABLE_CURRICULUM_ENHANCEMENTS && regCountry !== 'SG') {
+    container.innerHTML = '<p style="font-size:13px;color:var(--text3);padding:8px 0">Curriculum details can be completed after registration.</p>';
+    return;
+  }
+
+  const grades = CURRICULUM_DB.grades ? (CURRICULUM_DB.grades[regCountry] || {}) : {};
+  const fw = CURRICULUM_DB.frameworks || {};
   let html = '';
 
   if (regCountry === 'SG') {
@@ -2031,16 +2138,27 @@ window.showCRMTab = async tab => {
   if(curTab) curTab.style.display = curRole==='admin'?'':'none';
 
   // Each tab loader is wrapped individually — one crashed feature cannot take down the dashboard
+  // SAFE MODE flags gate risky new modules
   const _tabLoaders = {
     students:   () => loadStudents(),
     linking:    () => loadLinking(),
     subjects:   () => loadSubjects(),
     exams:      () => loadExams(),
-    apikeys:    () => curRole==='admin' ? loadApiKeys()   : Promise.resolve(),
+    apikeys:    () => curRole==='admin' ? loadApiKeys() : Promise.resolve(),
     settings:   () => loadSettings(),
-    messages:   () => loadMessages(),
-    homework:   () => loadHomework(),
-    curriculum: () => curRole==='admin' ? loadCurriculumAdmin() : Promise.resolve(),
+    messages:   () => ENABLE_MESSAGING
+                        ? loadMessages()
+                        : (()=>{ const p=document.getElementById('crm-panel-messages');
+                            if(p) p.innerHTML='<div style="padding:2rem;text-align:center;color:var(--text3);font-size:13px">Messaging is currently disabled (safe mode)</div>';
+                          })(),
+    homework:   () => ENABLE_HOMEWORK_EXTRAS
+                        ? loadHomework()
+                        : (()=>{ const p=document.getElementById('crm-panel-homework');
+                            if(p) p.innerHTML='<div style="padding:2rem;text-align:center;color:var(--text3);font-size:13px">Homework wizard is currently disabled (safe mode)</div>';
+                          })(),
+    curriculum: () => (ENABLE_ADMIN_EXTRAS && curRole==='admin')
+                        ? loadCurriculumAdmin()
+                        : Promise.resolve(),
   };
   if (_tabLoaders[tab]) {
     try {
@@ -2063,6 +2181,7 @@ window.showCRMTab = async tab => {
 async function loadStudents() {
   console.log('[EduSG] loadStudents — role:', curRole, 'uid:', curUser&&curUser.uid);
   const panel = document.getElementById('crm-panel-students');
+  if (!panel) { console.error('[EduSG] loadStudents: crm-panel-students not found in DOM'); return; }
   panel.innerHTML = '<div class="spinner-wrap"><div class="spinner"></div><div>Loading students…</div></div>';
   try {
     const q = curRole === 'teacher'
@@ -2502,6 +2621,7 @@ window.deleteSubject = async (id,name) => {
 /* ── API Keys panel (admin only) ── */
 async function loadApiKeys() {
   const panel = document.getElementById('crm-panel-apikeys');
+  if (!panel) { console.error('[EduSG] loadApiKeys: #crm-panel-apikeys not found'); return; }
   panel.innerHTML = '<div class="spinner-wrap"><div class="spinner"></div>Loading…</div>';
   try {
     const [aiSnap, tokenSnap] = await Promise.all([
@@ -2702,6 +2822,7 @@ window.deleteApiKey = async provider => {
 ══════════════════════════════════════════ */
 async function loadLinking() {
   const panel = document.getElementById('crm-panel-linking');
+  if (!panel) { console.error('[EduSG] loadLinking: #crm-panel-linking not found'); return; }
   panel.innerHTML = '<div class="spinner-wrap"><div class="spinner"></div>Loading…</div>';
   try {
     let html = '';
@@ -3761,6 +3882,7 @@ let examQuestions = {};
 
 async function loadExams() {
   const panel = document.getElementById('crm-panel-exams');
+  if (!panel) { console.error('[EduSG] loadExams: #crm-panel-exams not found'); return; }
   panel.innerHTML = '<div class="spinner-wrap"><div class="spinner"></div>Loading…</div>';
   try {
     const q = curRole === 'admin'
@@ -4308,6 +4430,7 @@ window.goCRM=()=>{
 /* ── List view ── */
 async function loadHomework() {
   const panel = document.getElementById('crm-panel-homework');
+  if (!panel) { console.error('[EduSG] loadHomework: #crm-panel-homework not found'); return; }
   panel.innerHTML = '<div class="spinner-wrap"><div class="spinner"></div>Loading homework…</div>';
   try {
     const q = curRole === 'admin'
@@ -4965,6 +5088,7 @@ let adminFwFilter = 'all', adminStdSearch = '';
 
 async function loadCurriculumAdmin() {
   const panel = document.getElementById('crm-panel-curriculum');
+  if (!panel) { console.error('[EduSG] loadCurriculumAdmin: #crm-panel-curriculum not found'); return; }
   panel.innerHTML = '<div class="spinner-wrap"><div class="spinner"></div>Loading curriculum data…</div>';
   try {
     const snap = await getDocs(query(collection(db,'curriculum_standards'),orderBy('createdAt','desc'))).catch(()=>null);
@@ -5190,8 +5314,34 @@ function getConvId(teacherId, studentId) {
   return teacherId + '_' + studentId;
 }
 
+/* ── Student message badge lazy-init (called after student shell is visible) ── */
+async function _initStudentMessageBadge() {
+  if (!ENABLE_MESSAGING) return;
+  if (!curUser || curRole !== 'student') return;
+  try {
+    const snap = await getDocs(query(
+      collection(db, 'conversations'),
+      where('studentId', '==', curUser.uid),
+      where('studentUnread', '>', 0)
+    ));
+    const count = snap.size;
+    const fab = document.getElementById('student-msg-fab');
+    if (fab && count > 0) {
+      const b = document.createElement('div');
+      b.className = 'msg-unread-dot';
+      b.textContent = count > 9 ? '9+' : count;
+      b.style.cssText = 'position:absolute;top:-2px;right:-2px;width:18px;height:18px;background:var(--err);border-radius:50%;border:2px solid var(--bg);font-size:9px;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700';
+      fab.style.position = 'relative';
+      fab.appendChild(b);
+    }
+  } catch(e) {
+    console.warn('[EduSG] _initStudentMessageBadge failed:', e.message);
+  }
+}
+
 /* ── Check unread messages and badge the tab ── */
 async function checkUnreadMessages() {
+  if (!ENABLE_MESSAGING) return;
   if (!curUser || curRole === 'student') return;
   try {
     const snap = await getDocs(query(
@@ -5211,6 +5361,7 @@ async function checkUnreadMessages() {
 /* ── Teacher: load conversation list ── */
 async function loadMessages() {
   const panel = document.getElementById('crm-panel-messages');
+  if (!panel) { console.error('[EduSG] loadMessages: #crm-panel-messages not found'); return; }
   panel.innerHTML = '<div class="spinner-wrap"><div class="spinner"></div>Loading conversations…</div>';
   try {
     const snap = await getDocs(query(
